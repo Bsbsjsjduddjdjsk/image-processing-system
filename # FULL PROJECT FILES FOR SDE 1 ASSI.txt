@@ -1,0 +1,268 @@
+# FULL PROJECT FILES FOR SDE 1 ASSIGNMENT BACKEND
+
+# requirements.txt
+fastapi
+uvicorn
+sqlalchemy
+asyncpg
+alembic
+pydantic
+python-multipart
+pillow
+pandas
+celery
+redis
+requests
+python-dotenv
+
+
+# main.py
+from fastapi import FastAPI
+from app.api import upload, status
+
+app = FastAPI(title="Image Processing Backend")
+
+app.include_router(upload.router, prefix="/api")
+app.include_router(status.router, prefix="/api")
+
+
+# app/api/upload.py
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from uuid import uuid4
+import pandas as pd
+from app.core.db import get_db
+from app.core.models import Request, Product, Image, RequestStatus
+from sqlalchemy.future import select
+from app.workers.image_worker import process_images_for_request
+
+router = APIRouter()
+
+@router.post("/upload")
+async def upload_csv(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only CSV files are allowed")
+
+    contents = await file.read()
+    try:
+        df = pd.read_csv(pd.io.common.BytesIO(contents))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid CSV format")
+
+    required_columns = ["S. No", "Product Name", "Input Image Urls"]
+    if not all(col in df.columns for col in required_columns):
+        raise HTTPException(status_code=400, detail="CSV must have columns: S. No, Product Name, Input Image Urls")
+
+    request_id = str(uuid4())
+    new_request = Request(request_id=request_id, status=RequestStatus.pending)
+    db.add(new_request)
+    await db.flush()
+
+    for _, row in df.iterrows():
+        product = Product(
+            request_id=new_request.id,
+            serial_no=row["S. No"],
+            product_name=row["Product Name"]
+        )
+        db.add(product)
+        await db.flush()
+
+        urls = [url.strip() for url in row["Input Image Urls"].split(",") if url.strip()]
+        for url in urls:
+            image = Image(product_id=product.id, input_url=url, status=RequestStatus.pending)
+            db.add(image)
+
+    await db.commit()
+
+    # Trigger background worker
+    process_images_for_request.delay(request_id)
+
+    return {"request_id": request_id, "status": "processing_started"}
+
+
+# app/api/status.py
+from fastapi import APIRouter, HTTPException, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from app.core.db import get_db
+from app.core.models import Request
+
+router = APIRouter()
+
+@router.get("/status/{request_id}")
+async def check_status(request_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Request).where(Request.request_id == request_id))
+    req = result.scalar_one_or_none()
+
+    if not req:
+        raise HTTPException(status_code=404, detail="Request ID not found")
+
+    response = {
+        "request_id": req.request_id,
+        "status": req.status,
+        "products": []
+    }
+
+    for product in req.products:
+        product_data = {
+            "serial_no": product.serial_no,
+            "product_name": product.product_name,
+            "input_image_urls": [],
+            "output_image_urls": []
+        }
+        for image in product.images:
+            product_data["input_image_urls"].append(image.input_url)
+            product_data["output_image_urls"].append(image.output_url if image.output_url else None)
+
+        response["products"].append(product_data)
+
+    return response
+
+
+# app/core/db.py
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://postgres:password@localhost/image_db")
+
+engine = create_async_engine(DATABASE_URL, echo=True)
+SessionLocal = sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+Base = declarative_base()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# app/core/models.py
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Text, Enum
+from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
+from app.core.db import Base
+import enum
+
+class RequestStatus(str, enum.Enum):
+    pending = "pending"
+    processing = "processing"
+    completed = "completed"
+    failed = "failed"
+
+class Request(Base):
+    __tablename__ = "requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    request_id = Column(String, unique=True, index=True)
+    status = Column(Enum(RequestStatus), default=RequestStatus.pending)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    products = relationship("Product", back_populates="request")
+
+class Product(Base):
+    __tablename__ = "products"
+
+    id = Column(Integer, primary_key=True, index=True)
+    request_id = Column(Integer, ForeignKey("requests.id"))
+    serial_no = Column(Integer)
+    product_name = Column(String)
+
+    request = relationship("Request", back_populates="products")
+    images = relationship("Image", back_populates="product")
+
+class Image(Base):
+    __tablename__ = "images"
+
+    id = Column(Integer, primary_key=True, index=True)
+    product_id = Column(Integer, ForeignKey("products.id"))
+    input_url = Column(Text)
+    output_url = Column(Text, nullable=True)
+    status = Column(Enum(RequestStatus), default=RequestStatus.pending)
+
+    product = relationship("Product", back_populates="images")
+
+
+# app/utils/image_utils.py
+import requests
+from PIL import Image
+from io import BytesIO
+import os
+import uuid
+
+OUTPUT_DIR = "processed_images"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def compress_image_from_url(url: str) -> str:
+    response = requests.get(url)
+    if response.status_code != 200:
+        raise Exception("Image download failed")
+
+    img = Image.open(BytesIO(response.content))
+    img = img.convert("RGB")  # to ensure compatibility
+
+    output_path = os.path.join(OUTPUT_DIR, f"{uuid.uuid4()}.jpg")
+    img.save(output_path, format="JPEG", quality=50)
+
+    return output_path
+
+
+# app/workers/image_worker.py
+from celery import shared_task
+from app.utils.image_utils import compress_image_from_url
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from app.core.db import SessionLocal
+from app.core.models import Image, Product, Request, RequestStatus
+import asyncio
+
+@shared_task
+def process_images_for_request(request_id: str):
+    asyncio.run(_process_images_async(request_id))
+
+async def _process_images_async(request_id: str):
+    async with SessionLocal() as session:
+        result = await session.execute(select(Request).where(Request.request_id == request_id))
+        req = result.scalar_one_or_none()
+        if not req:
+            return
+
+        req.status = RequestStatus.processing
+        await session.commit()
+
+        all_done = True
+
+        for product in req.products:
+            for image in product.images:
+                try:
+                    output_path = compress_image_from_url(image.input_url)
+                    image.output_url = output_path
+                    image.status = RequestStatus.completed
+                except Exception as e:
+                    image.status = RequestStatus.failed
+                    all_done = False
+
+        req.status = RequestStatus.completed if all_done else RequestStatus.failed
+        await session.commit()
+
+
+# celery_worker.py
+from celery import Celery
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+celery = Celery(
+    "image_tasks",
+    broker=REDIS_URL,
+    backend=REDIS_URL
+)
+
+celery.autodiscover_tasks(['app.workers'])
